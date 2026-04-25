@@ -11,13 +11,12 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 
 
 CONFIG_PATH = "monitors.json"
 STATE_PATH = ".stock_state.json"
+STATE_BLOB_CONTAINER = "stock-notifier-state"
+STATE_BLOB_NAME = "stock_state.json"
 EXAMPLE_MONITORS = [
     {
         "name": "Myntra product",
@@ -72,6 +71,28 @@ def read_monitors(path: str) -> List[Monitor]:
     return monitors
 
 
+def read_monitors_from_env() -> Optional[List[Monitor]]:
+    raw_value = os.environ.get("MONITORS_JSON")
+    if not raw_value:
+        return None
+
+    raw_monitors = json.loads(raw_value)
+    monitors = []
+    for item in raw_monitors:
+        monitors.append(
+            Monitor(
+                name=str(item.get("name") or item.get("url")),
+                url=str(item["url"]).strip(),
+                size=str(item["size"]).strip(),
+            )
+        )
+    return monitors
+
+
+def load_monitors(path: str = CONFIG_PATH) -> List[Monitor]:
+    return read_monitors_from_env() or read_monitors(path)
+
+
 def write_example_monitors(path: str) -> None:
     with open(path, "w", encoding="utf-8") as file:
         json.dump(EXAMPLE_MONITORS, file, indent=2)
@@ -88,6 +109,63 @@ def read_state(path: str) -> Dict[str, bool]:
 def write_state(path: str, state: Dict[str, bool]) -> None:
     with open(path, "w", encoding="utf-8") as file:
         json.dump(state, file, indent=2, sort_keys=True)
+
+
+def get_blob_state_client():
+    connection_string = os.environ.get("STOCK_STATE_CONNECTION_STRING") or os.environ.get(
+        "AzureWebJobsStorage"
+    )
+    if not connection_string:
+        return None
+
+    try:
+        from azure.storage.blob import BlobServiceClient
+    except ImportError:
+        return None
+
+    container_name = os.environ.get("STOCK_STATE_CONTAINER", STATE_BLOB_CONTAINER)
+    blob_name = os.environ.get("STOCK_STATE_BLOB", STATE_BLOB_NAME)
+    service = BlobServiceClient.from_connection_string(connection_string)
+    container = service.get_container_client(container_name)
+    try:
+        container.create_container()
+    except Exception:
+        pass
+    return container.get_blob_client(blob_name)
+
+
+def use_blob_state() -> bool:
+    if os.environ.get("USE_BLOB_STATE"):
+        return str_to_bool(os.environ.get("USE_BLOB_STATE"), default=True)
+    return bool(os.environ.get("AzureWebJobsStorage"))
+
+
+def read_state_store(path: str = STATE_PATH) -> Dict[str, bool]:
+    if not use_blob_state():
+        return read_state(path)
+
+    blob = get_blob_state_client()
+    if blob is None:
+        return read_state(path)
+
+    try:
+        data = blob.download_blob().readall().decode("utf-8")
+        return json.loads(data)
+    except Exception:
+        return {}
+
+
+def write_state_store(state: Dict[str, bool], path: str = STATE_PATH) -> None:
+    if not use_blob_state():
+        write_state(path, state)
+        return
+
+    blob = get_blob_state_client()
+    if blob is None:
+        write_state(path, state)
+        return
+
+    blob.upload_blob(json.dumps(state, indent=2, sort_keys=True), overwrite=True)
 
 
 def state_key(monitor: Monitor) -> str:
@@ -312,7 +390,7 @@ def open_product_page(page, url: str) -> None:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             return
-        except PlaywrightError as exc:
+        except Exception as exc:
             last_error = exc
             print(f"Page load attempt {attempt} failed: {exc}")
             time.sleep(3 * attempt)
@@ -321,6 +399,8 @@ def open_product_page(page, url: str) -> None:
 
 
 def check_myntra_stock(page, monitor: Monitor) -> StockResult:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
     open_product_page(page, monitor.url)
 
     try:
@@ -398,7 +478,7 @@ def check_myntra_stock(page, monitor: Monitor) -> StockResult:
 
 
 def run_check(monitors: List[Monitor], send_notifications: bool) -> None:
-    state = read_state(STATE_PATH)
+    state = read_state_store(STATE_PATH)
     headless = str_to_bool(os.environ.get("HEADLESS", "true"))
     browser_fallback = str_to_bool(os.environ.get("BROWSER_FALLBACK", "false"), default=False)
     playwright = None
@@ -418,6 +498,8 @@ def run_check(monitors: List[Monitor], send_notifications: bool) -> None:
 
                 if result is None and browser_fallback:
                     if browser is None:
+                        from playwright.sync_api import sync_playwright
+
                         playwright = sync_playwright().start()
                         browser = playwright.chromium.launch(headless=headless)
                         context = browser.new_context(
@@ -464,7 +546,7 @@ def run_check(monitors: List[Monitor], send_notifications: bool) -> None:
         if playwright is not None:
             playwright.stop()
 
-    write_state(STATE_PATH, state)
+    write_state_store(state, STATE_PATH)
 
 
 def main() -> None:
@@ -483,7 +565,7 @@ def main() -> None:
     args = parser.parse_args()
 
     load_dotenv()
-    monitors = read_monitors(args.config)
+    monitors = load_monitors(args.config)
     interval = int(os.environ.get("CHECK_INTERVAL_SECONDS", "900"))
 
     while True:

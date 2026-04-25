@@ -1,0 +1,16 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "SMTP_HOST": "smtp.gmail.com",
+    "SMTP_PORT": "587",
+    "SMTP_USERNAME": "your-email@gmail.com",
+    "SMTP_PASSWORD": "your-google-app-password",
+    "EMAIL_FROM": "your-email@gmail.com",
+    "EMAIL_TO": "destination-email@gmail.com",
+    "MONITORS_JSON": "[{\"name\":\"Myntra jeans\",\"url\":\"https://www.myntra.com/jeans/snitch/snitch-men-straight-fit-mid-rise-jeans/38525890/buy\",\"size\":\"30\"}]",
+    "USE_BLOB_STATE": "true",
+    "BROWSER_FALLBACK": "false"
+  }
+}
