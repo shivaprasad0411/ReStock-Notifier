@@ -1,5 +1,7 @@
 import argparse
+import html as html_lib
 import json
+import logging
 import os
 import re
 import smtplib
@@ -24,6 +26,15 @@ EXAMPLE_MONITORS = [
         "size": "M",
     }
 ]
+
+logging.getLogger("azure").setLevel(logging.WARNING)
+
+
+def log_info(message: str, *args: Any) -> None:
+    if os.environ.get("FUNCTIONS_WORKER_RUNTIME"):
+        logging.info(message, *args)
+    else:
+        print(message % args if args else message)
 
 
 @dataclass
@@ -226,6 +237,8 @@ def fetch_myntra_product(product_id: str) -> Optional[Dict[str, Any]]:
         headers={
             "Accept": "application/json,text/plain,*/*",
             "Accept-Language": "en-IN,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -238,7 +251,7 @@ def fetch_myntra_product(product_id: str) -> Optional[Dict[str, Any]]:
         with urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except (OSError, URLError, json.JSONDecodeError) as exc:
-        print(f"Myntra API check failed: {exc}")
+        log_info("Myntra API check failed: %s", exc)
         return None
 
 
@@ -248,6 +261,12 @@ def fetch_myntra_html(url: str) -> Optional[str]:
         headers={
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-IN,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Upgrade-Insecure-Requests": "1",
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -259,12 +278,20 @@ def fetch_myntra_html(url: str) -> Optional[str]:
         with urlopen(request, timeout=30) as response:
             return response.read().decode("utf-8", errors="replace")
     except (OSError, URLError) as exc:
-        print(f"Myntra HTML check failed: {exc}")
+        log_info("Myntra HTML check failed: %s", exc)
         return None
 
 
 def extract_myntra_state(html: str) -> Optional[Dict[str, Any]]:
-    marker = "window.__myx = "
+    markers = ["window.__myx = ", "window.__myx="]
+    marker = next((value for value in markers if value in html), None)
+    if not marker:
+        if "sec-overlay" in html or "captcha" in html.lower():
+            log_info("Myntra HTML did not include product data; it looks like a security page.")
+        else:
+            log_info("Myntra HTML did not include the expected embedded product data.")
+        return None
+
     start = html.find(marker)
     if start == -1:
         return None
@@ -274,8 +301,51 @@ def extract_myntra_state(html: str) -> Optional[Dict[str, Any]]:
         state, _ = decoder.raw_decode(html[start + len(marker) :])
         return state
     except json.JSONDecodeError as exc:
-        print(f"Myntra embedded data parse failed: {exc}")
+        log_info("Myntra embedded data parse failed: %s", exc)
         return None
+
+
+def extract_schema_product_stock(html: str, monitor: Monitor) -> Optional[StockResult]:
+    scripts = re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    for script in scripts:
+        text = html_lib.unescape(script).strip()
+        if not text:
+            continue
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        for item in iter_dicts(data):
+            if item.get("@type") != "Product":
+                continue
+
+            title = item.get("name")
+            offers = item.get("offers") or {}
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+
+            availability = str(offers.get("availability") or "").lower()
+            if "outofstock" in availability or "out_of_stock" in availability:
+                return StockResult(False, "Schema.org data reports the product is out of stock", title)
+
+            if "instock" in availability or "in_stock" in availability:
+                return StockResult(
+                    False,
+                    (
+                        "Schema.org data reports the product is in stock, but size-specific "
+                        f"data for {monitor.size} was not available"
+                    ),
+                    title,
+                )
+
+    return None
 
 
 def iter_dicts(value: Any):
@@ -360,7 +430,7 @@ def check_myntra_html_stock(monitor: Monitor) -> Optional[StockResult]:
 
     state = extract_myntra_state(html)
     if not state:
-        return None
+        return extract_schema_product_stock(html, monitor)
 
     product = state.get("pdpData") or {}
     title = product.get("name")
@@ -392,7 +462,7 @@ def open_product_page(page, url: str) -> None:
             return
         except Exception as exc:
             last_error = exc
-            print(f"Page load attempt {attempt} failed: {exc}")
+            log_info("Page load attempt %s failed: %s", attempt, exc)
             time.sleep(3 * attempt)
 
     raise last_error
@@ -528,15 +598,15 @@ def run_check(monitors: List[Monitor], send_notifications: bool) -> None:
                         "could not read Myntra product data; set BROWSER_FALLBACK=true to try browser scraping",
                     )
 
-                print(f"[{monitor.name}] size {monitor.size}: {result.reason}")
+                log_info("[%s] size %s: %s", monitor.name, monitor.size, result.reason)
 
                 if result.in_stock and not was_in_stock and send_notifications:
                     send_email(monitor, result)
-                    print(f"[{monitor.name}] email notification sent")
+                    log_info("[%s] email notification sent", monitor.name)
 
                 state[key] = result.in_stock
             except Exception as exc:
-                print(f"[{monitor.name}] check failed: {exc}")
+                log_info("[%s] check failed: %s", monitor.name, exc)
 
         if context is not None:
             context.close()
@@ -572,7 +642,7 @@ def main() -> None:
         run_check(monitors, send_notifications=not args.no_email)
         if args.once:
             break
-        print(f"Sleeping for {interval} seconds")
+        log_info("Sleeping for %s seconds", interval)
         time.sleep(interval)
 
 
