@@ -1,0 +1,5 @@
+.venv/
+.env
+.stock_state.json
+__pycache__/
+*.pyc
