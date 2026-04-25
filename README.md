@@ -1,4 +1,4 @@
-# Myntra Size Stock Notifier
+# Re Stock Notifier
 
 This is a small Python monitor that checks whether a selected Myntra size looks available and emails you when it comes back in stock.
 
